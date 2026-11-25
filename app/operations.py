@@ -1,35 +1,54 @@
 from datetime import datetime, timezone
 import json
-from typing import Optional
 import uuid
-
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
 from pydantic import BaseModel, Field
 from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.auth import User, get_current_user
 from app.database import Base, get_db
 
 router = APIRouter(prefix="/ops", tags=["Transit Operations"])
 
+DEFAULT_BUS_SEEDS: list[dict] = [
+    {
+        "trip_id": 1,
+        "vehicle_plate": "HXX 452 EC",
+        "route_code": "RT-01",
+        "passengers_onboard": 0,
+        "capacity": 60,
+    },
+    {
+        "trip_id": 2,
+        "vehicle_plate": "KZN 819 EC",
+        "route_code": "RT-02",
+        "passengers_onboard": 0,
+        "capacity": 60,
+    },
+    {
+        "trip_id": 3,
+        "vehicle_plate": "JLP 304 EC",
+        "route_code": "RT-03",
+        "passengers_onboard": 0,
+        "capacity": 50,
+    },
+]
+
 
 # ==================== DATABASE MODELS ====================
 class CommuterWallet(Base):
     __tablename__ = "commuter_wallets"
-
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
-    balance_zar = Column(Float, default=145.0, nullable=False)
+    balance_zar = Column(Float, default=0.0, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
 class WalletTransaction(Base):
     __tablename__ = "wallet_transactions"
-
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
-    tx_type = Column(String(24), nullable=False)  # "TOPUP" | "TICKET_PURCHASE"
+    tx_type = Column(String(24), nullable=False)  # "TOPUP" | "TICKET_PURCHASE" | "BOARDING"
     title = Column(String(160), nullable=False)
     amount_zar = Column(Float, nullable=False)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
@@ -37,7 +56,6 @@ class WalletTransaction(Base):
 
 class BoardingTicket(Base):
     __tablename__ = "boarding_tickets"
-
     id = Column(Integer, primary_key=True, index=True)
     ticket_code = Column(String(48), unique=True, index=True, nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
@@ -51,7 +69,6 @@ class BoardingTicket(Base):
 
 class FleetIncident(Base):
     __tablename__ = "fleet_incidents"
-
     id = Column(Integer, primary_key=True, index=True)
     route_code = Column(String(16), index=True, nullable=False)
     vehicle_plate = Column(String(32), nullable=False)
@@ -61,6 +78,17 @@ class FleetIncident(Base):
     description = Column(String(280), nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class BusOccupancyState(Base):
+    __tablename__ = "bus_occupancy_state"
+    id = Column(Integer, primary_key=True, index=True)
+    trip_id = Column(Integer, unique=True, index=True, nullable=False)
+    vehicle_plate = Column(String(32), nullable=False)
+    route_code = Column(String(16), nullable=False)
+    passengers_onboard = Column(Integer, default=0, nullable=False)
+    capacity = Column(Integer, default=60, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
 # ==================== SCHEMAS ====================
@@ -76,6 +104,10 @@ class BuyTicketRequest(BaseModel):
 
 class ValidateTicketRequest(BaseModel):
     ticket_code: str = Field(..., min_length=4, max_length=48)
+
+
+class BoardBusRequest(BaseModel):
+    passengers: int = Field(default=1, ge=1, le=20)
 
 
 class CreateIncidentRequest(BaseModel):
@@ -98,7 +130,9 @@ class LiveEventHub:
 
     def disconnect_trip(self, trip_id: int, websocket: WebSocket):
         if trip_id in self.trip_sockets:
-            self.trip_sockets[trip_id] = [w for w in self.trip_sockets[trip_id] if w != websocket]
+            self.trip_sockets[trip_id] = [
+                w for w in self.trip_sockets[trip_id] if w != websocket
+            ]
 
     async def broadcast_trip(self, trip_id: int, payload: dict):
         message = json.dumps(payload)
@@ -135,20 +169,62 @@ hub = LiveEventHub()
 
 # ==================== HELPERS ====================
 async def get_or_create_wallet(user_id: int, db: AsyncSession) -> CommuterWallet:
-    res = await db.execute(select(CommuterWallet).where(CommuterWallet.user_id == user_id))
+    res = await db.execute(
+        select(CommuterWallet).where(CommuterWallet.user_id == user_id)
+    )
     wallet = res.scalar_one_or_none()
     if not wallet:
-        wallet = CommuterWallet(user_id=user_id, balance_zar=145.0)
+        wallet = CommuterWallet(user_id=user_id, balance_zar=0.0)
         db.add(wallet)
         await db.commit()
         await db.refresh(wallet)
     return wallet
 
 
+async def ensure_bus_occupancy_rows(db: AsyncSession) -> list[BusOccupancyState]:
+    res = await db.execute(select(BusOccupancyState).order_by(BusOccupancyState.trip_id.asc()))
+    rows = res.scalars().all()
+    existing_ids = {r.trip_id for r in rows}
+    created = False
+    for seed in DEFAULT_BUS_SEEDS:
+        if seed["trip_id"] not in existing_ids:
+            db.add(
+                BusOccupancyState(
+                    trip_id=seed["trip_id"],
+                    vehicle_plate=seed["vehicle_plate"],
+                    route_code=seed["route_code"],
+                    passengers_onboard=seed["passengers_onboard"],
+                    capacity=seed["capacity"],
+                )
+            )
+            created = True
+    if created:
+        await db.commit()
+        res = await db.execute(
+            select(BusOccupancyState).order_by(BusOccupancyState.trip_id.asc())
+        )
+        rows = res.scalars().all()
+    return rows
+
+
+def serialize_occupancy(row: BusOccupancyState) -> dict:
+    cap = max(1, int(row.capacity))
+    pax = max(0, int(row.passengers_onboard))
+    pct = min(100, round((pax / cap) * 100))
+    return {
+        "trip_id": row.trip_id,
+        "vehicle_plate": row.vehicle_plate,
+        "route_code": row.route_code,
+        "passengers_onboard": pax,
+        "capacity": cap,
+        "occupancy": f"{pct}%",
+    }
+
+
 async def compute_summary_payload(db: AsyncSession) -> dict:
     tickets_res = await db.execute(select(BoardingTicket))
     tickets = tickets_res.scalars().all()
-    db_revenue = sum(float(t.fare_zar) for t in tickets)
+    db_revenue = round(sum(float(t.fare_zar) for t in tickets), 2)
     db_ticket_count = len(tickets)
 
     inc_res = await db.execute(
@@ -158,9 +234,13 @@ async def compute_summary_payload(db: AsyncSession) -> dict:
     )
     incidents = inc_res.scalars().all()
 
+    occ_rows = await ensure_bus_occupancy_rows(db)
+    bus_occupancies = [serialize_occupancy(r) for r in occ_rows]
+
     return {
-        "total_fare_revenue": round(71040.0 + db_revenue, 2),
-        "tickets_sold_today": 3840 + db_ticket_count,
+        "total_fare_revenue": db_revenue,
+        "tickets_sold_today": db_ticket_count,
+        "bus_occupancies": bus_occupancies,
         "incidents": [
             {
                 "id": inc.id,
@@ -185,7 +265,6 @@ async def get_wallet_state(
     db: AsyncSession = Depends(get_db),
 ):
     wallet = await get_or_create_wallet(current_user.id, db)
-
     tx_res = await db.execute(
         select(WalletTransaction)
         .where(WalletTransaction.user_id == current_user.id)
@@ -235,9 +314,10 @@ async def topup_wallet(
     db: AsyncSession = Depends(get_db),
 ):
     wallet = await get_or_create_wallet(current_user.id, db)
-    wallet.balance_zar = round(float(wallet.balance_zar) + float(payload.amount_zar), 2)
+    wallet.balance_zar = round(
+        float(wallet.balance_zar) + float(payload.amount_zar), 2
+    )
     wallet.updated_at = datetime.now(timezone.utc)
-
     tx = WalletTransaction(
         user_id=current_user.id,
         tx_type="TOPUP",
@@ -247,7 +327,6 @@ async def topup_wallet(
     db.add(tx)
     await db.commit()
     await db.refresh(wallet)
-
     return {"balance_zar": wallet.balance_zar, "tx_id": tx.id}
 
 
@@ -264,12 +343,13 @@ async def buy_ticket(
             detail="Insufficient wallet balance. Please top up first.",
         )
 
-    wallet.balance_zar = round(float(wallet.balance_zar) - float(payload.fare_zar), 2)
+    wallet.balance_zar = round(
+        float(wallet.balance_zar) - float(payload.fare_zar), 2
+    )
     wallet.updated_at = datetime.now(timezone.utc)
 
     short_uid = uuid.uuid4().hex[:6].upper()
     ticket_code = f"TP-{payload.route_code}-{short_uid}"
-
     ticket = BoardingTicket(
         ticket_code=ticket_code,
         user_id=current_user.id,
@@ -313,20 +393,84 @@ async def validate_ticket(
     db: AsyncSession = Depends(get_db),
 ):
     res = await db.execute(
-        select(BoardingTicket).where(BoardingTicket.ticket_code == payload.ticket_code.strip())
+        select(BoardingTicket).where(
+            BoardingTicket.ticket_code == payload.ticket_code.strip()
+        )
     )
     ticket = res.scalar_one_or_none()
     if not ticket:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Boarding pass not found.")
-
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Boarding pass not found."
+        )
     ticket.status = "VALIDATED"
     ticket.validated_at = datetime.now(timezone.utc)
     await db.commit()
-
     return {
         "ticket_code": ticket.ticket_code,
         "status": ticket.status,
         "validated_at": ticket.validated_at.strftime("%H:%M"),
+    }
+
+
+@router.post("/buses/{trip_id}/board")
+async def board_bus_demo(
+    trip_id: int,
+    payload: BoardBusRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await ensure_bus_occupancy_rows(db)
+    res = await db.execute(
+        select(BusOccupancyState).where(BusOccupancyState.trip_id == trip_id)
+    )
+    bus_row = res.scalar_one_or_none()
+    if not bus_row:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Bus trip {trip_id} not found.",
+        )
+
+    if bus_row.passengers_onboard >= bus_row.capacity:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{bus_row.vehicle_plate} is at full capacity ({bus_row.capacity} seats).",
+        )
+
+    new_pax = min(
+        bus_row.capacity, bus_row.passengers_onboard + int(payload.passengers)
+    )
+    boarded_count = new_pax - bus_row.passengers_onboard
+    bus_row.passengers_onboard = new_pax
+    bus_row.updated_at = datetime.now(timezone.utc)
+
+    db.add(
+        WalletTransaction(
+            user_id=current_user.id,
+            tx_type="BOARDING",
+            title=f"Boarded {bus_row.vehicle_plate} ({bus_row.route_code}) +{boarded_count} pax",
+            amount_zar=0.0,
+        )
+    )
+    await db.commit()
+    await db.refresh(bus_row)
+
+    occ_payload = serialize_occupancy(bus_row)
+    summary = await compute_summary_payload(db)
+    await hub.broadcast_trip(
+        trip_id,
+        {
+            "trip_id": trip_id,
+            "occupancy": occ_payload["occupancy"],
+            "passengers_onboard": occ_payload["passengers_onboard"],
+            "capacity": occ_payload["capacity"],
+        },
+    )
+    await hub.broadcast_event({"type": "OCCUPANCY_UPDATED", **summary})
+
+    return {
+        "message": f"Boarded {bus_row.vehicle_plate} ({occ_payload['passengers_onboard']}/{occ_payload['capacity']} onboard).",
+        "boarding": occ_payload,
+        "summary": summary,
     }
 
 
@@ -349,7 +493,6 @@ async def create_incident(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only drivers or management can broadcast route incidents.",
         )
-
     incident = FleetIncident(
         route_code=payload.route_code.upper(),
         vehicle_plate=payload.vehicle_plate.upper(),
@@ -362,10 +505,8 @@ async def create_incident(
     db.add(incident)
     await db.commit()
     await db.refresh(incident)
-
     summary = await compute_summary_payload(db)
     await hub.broadcast_event({"type": "INCIDENT_CREATED", **summary})
-
     return {"id": incident.id, "incidents": summary["incidents"]}
 
 
@@ -376,16 +517,19 @@ async def resolve_incident(
     db: AsyncSession = Depends(get_db),
 ):
     if current_user.role not in ("driver", "admin"):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized.")
-
-    res = await db.execute(select(FleetIncident).where(FleetIncident.id == incident_id))
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized."
+        )
+    res = await db.execute(
+        select(FleetIncident).where(FleetIncident.id == incident_id)
+    )
     inc = res.scalar_one_or_none()
     if not inc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found.")
-
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found."
+        )
     inc.is_active = False
     await db.commit()
-
     summary = await compute_summary_payload(db)
     await hub.broadcast_event({"type": "INCIDENT_RESOLVED", **summary})
     return {"incidents": summary["incidents"]}
@@ -404,10 +548,9 @@ async def websocket_track(
             data = json.loads(raw)
             lat = float(data["latitude"])
             lng = float(data["longitude"])
-            speed = float(data.get("speed", 42.0))
-            heading = float(data.get("heading", 120.0))
-            occupancy = str(data.get("occupancy", "68%"))
-
+            speed = float(data.get("speed", 0.0))
+            heading = float(data.get("heading", 0.0))
+            occupancy = str(data.get("occupancy", "0%"))
             point_wkt = f"SRID=4326;POINT({lng} {lat})"
             insert_query = text(
                 """
@@ -417,10 +560,14 @@ async def websocket_track(
             )
             await db.execute(
                 insert_query,
-                {"trip_id": trip_id, "wkt": point_wkt, "speed": speed, "heading": heading},
+                {
+                    "trip_id": trip_id,
+                    "wkt": point_wkt,
+                    "speed": speed,
+                    "heading": heading,
+                },
             )
             await db.commit()
-
             await hub.broadcast_trip(
                 trip_id,
                 {
